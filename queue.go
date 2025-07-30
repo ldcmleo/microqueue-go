@@ -1,4 +1,4 @@
-package main
+package microqueuego
 
 import (
 	"errors"
@@ -17,23 +17,40 @@ type Queue struct {
 	wg           sync.WaitGroup
 	jobsInFlight map[string]Job
 	mu           sync.Mutex
+	store        *Store
 }
 
-func NewQueue(workerCount int) *Queue {
+func NewQueue(workerCount int, store *Store) *Queue {
 	return &Queue{
 		jobCh:        make(chan Job),
 		retryCh:      make(chan Job),
 		workerCount:  workerCount,
 		shutdownCh:   make(chan struct{}),
 		jobsInFlight: make(map[string]Job),
+		store:        store,
 	}
 }
 
 func (q *Queue) Start() {
+	initialJobs, err := q.store.GetPendingJobs()
+	if err != nil {
+		fmt.Printf("Error loading pending jobs from DB: %v\n", err)
+	} else {
+		fmt.Printf("Loading %d pending jobs from DB.\n", len(initialJobs))
+		for _, job := range initialJobs {
+			if job.Status == StatusRetry && time.Now().Before(job.NextAttemptAt) {
+				q.retryCh <- job
+			} else {
+				q.jobCh <- job
+			}
+		}
+	}
+
 	for i := 0; i < q.workerCount; i++ {
 		q.wg.Add(1)
 		go q.worker(i)
 	}
+
 	q.wg.Add(1)
 	go q.scheduler()
 	fmt.Printf("Queue started with %d workers and 1 scheduler.\n", q.workerCount)
@@ -51,7 +68,24 @@ func (q *Queue) Stop() {
 	close(q.shutdownCh)
 	q.wg.Wait()
 	close(q.jobCh)
+	if q.store != nil {
+		err := q.store.DB.Close()
+		if err != nil {
+			fmt.Printf("Error closing database: %v\n", err)
+		}
+	}
+
 	fmt.Println("Queue stopped.")
+}
+
+func (q *Queue) PrintLog() {
+	fmt.Println("\nResults:")
+	q.mu.Lock()
+	for _, job := range q.jobsInFlight {
+		fmt.Printf("  ID: %s, URL: %s, State: %s, Retries: %d\n", job.ID, job.TargetURL, job.Status, job.Retries)
+	}
+
+	q.mu.Unlock()
 }
 
 func (q *Queue) worker(id int) {
@@ -74,7 +108,6 @@ func (q *Queue) worker(id int) {
 
 			// llamar al handeJob
 			err := q.handleJob(job)
-
 			q.mu.Lock()
 			if err != nil {
 				job.LastError = err.Error()
@@ -84,20 +117,20 @@ func (q *Queue) worker(id int) {
 					job.NextAttemptAt = time.Now().Add(exponentialBackoff(job.Retries))
 					fmt.Printf("Worker %d: Job %s failed, retrying in %s (Retries %d/%d). Error: %s\n",
 						id, job.ID, time.Until(job.NextAttemptAt).Round(time.Second), job.Retries, job.MaxRetries, err)
-					q.jobsInFlight[job.ID] = job // Actualizar en el mapa
+					q.jobsInFlight[job.ID] = job
 					q.retryCh <- job
 				} else {
 					job.Status = StatusFailed
 					fmt.Printf("Worker %d: Job %s failed totally after %d retries. Error: %s\n",
 						id, job.ID, job.Retries, err)
-					q.jobsInFlight[job.ID] = job // Actualizar en el mapa
-					// Aquí podrías loguear a un "dead-letter log" o un archivo de fallos.
+					q.jobsInFlight[job.ID] = job
 				}
 			} else {
 				job.Status = StatusCompleted
-				fmt.Printf("Worker %d: Trabajo %s completado con éxito.\n", id, job.ID)
-				delete(q.jobsInFlight, job.ID) // Eliminar del mapa de trabajos en vuelo si se completó
+				fmt.Printf("Worker %d: Job %s completed successfully.\n", id, job.ID)
+				delete(q.jobsInFlight, job.ID)
 			}
+
 			q.mu.Unlock()
 		case <-q.shutdownCh:
 			fmt.Printf("Worker %d: Shutdown signal received, exit...\n", id)
@@ -107,28 +140,24 @@ func (q *Queue) worker(id int) {
 }
 
 func (q *Queue) scheduler() {
-	defer q.wg.Done() // Asegura que el scheduler se registre con WaitGroup
+	defer q.wg.Done()
 	fmt.Println("Scheduler started.")
-
-	// Mapa interno del scheduler para los trabajos a reintentar
-	// Este mapa es accedido SOLO por esta goroutine, por lo que NO necesita mutex
 	scheduledJobs := make(map[string]Job)
-	ticker := time.NewTicker(1 * time.Second) // Revisa cada segundo
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
-		case job := <-q.retryCh: // Un trabajo fallido que necesita ser programado
+		case job := <-q.retryCh:
 			scheduledJobs[job.ID] = job
 			fmt.Printf("Scheduler: Job %s programmed to retry in %s.\n", job.ID, job.NextAttemptAt.Format("15:04:05"))
 
-		case <-ticker.C: // Cada segundo, revisa los trabajos a reintentar
+		case <-ticker.C:
 			now := time.Now()
 			for id, job := range scheduledJobs {
 				if now.After(job.NextAttemptAt) {
 					fmt.Printf("Scheduler: sending job %s to retry (retry %d).\n", job.ID, job.Retries)
-					q.jobCh <- job            // Enviar de vuelta a la cola principal
-					delete(scheduledJobs, id) // Quitar del mapa del scheduler
+					q.jobCh <- job
+					delete(scheduledJobs, id)
 				}
 			}
 		case <-q.shutdownCh:
@@ -150,7 +179,7 @@ func (q *Queue) handleJob(job Job) error {
 func dispatchWebhook(job Job) error {
 	fmt.Printf("  -> Sending webhook for job %s a %s\n", job.ID, job.TargetURL)
 	if rand.IntN(100) < 50 {
-		return errors.New("simulated webhooj failure (e.g., HTTP 500)")
+		return errors.New("simulated webhook failure (e.g., HTTP 500)")
 	}
 
 	return nil

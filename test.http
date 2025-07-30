@@ -1,0 +1,10 @@
+POST http://localhost:8080/submit HTTP/1.1
+Content-Type: "application/json"
+
+{
+    "payload": {
+        "mydata": "this is my data to send to the queue system",
+        "anything": "here will be in the last part of the system"
+    },
+    "target_url": "http://localhost:8081"
+}
